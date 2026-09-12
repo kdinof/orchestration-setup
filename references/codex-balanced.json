@@ -1,0 +1,6 @@
+{
+  "scout": {"model": "gpt-5.6-luna", "model_reasoning_effort": "low"},
+  "fast-worker": {"model": "gpt-5.6-terra", "model_reasoning_effort": "medium"},
+  "deep-reasoner": {"model": "gpt-6-astra", "model_reasoning_effort": "high"},
+  "reviewer": {"model": "gpt-6-astra", "model_reasoning_effort": "high"}
+}

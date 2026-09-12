@@ -1,214 +1,233 @@
 #!/usr/bin/env python3
-"""Generate tasks/ run folders from the project's dev plan.
+"""Generate validated, restart-safe task runs (Python 3.9+, standard library).
 
-One run = one orchestrator session, boundaries = stage gates.
-Re-runnable: overwrites generated files (README status checkboxes are
-regenerated too, so re-run only BETWEEN runs, never mid-run).
-
-Требуемый формат плана (markdown):
-  ## <n>. Этап <N> — <Название этапа>
-  **Gate:** <критерий закрытия этапа>
-  ### Волна <N.X> — <режим: последовательно/параллельно (...)>
+Format:
+  ## 1. Этап 0 — Foundation
+  **Gate:** executable integration scenario
+  ### Волна 0.1 — последовательно (or параллельно)
   | ID | Задача | Размер | Зависит | Владение | Контекст | Сделать / Приёмка |
-  |---|---|---|---|---|---|---|
-  | T0.1 | ... | L | — | ... | ... | ... **Приёмка:** ... |
+  | T0.1 | Name | S | — | `src/file.py` | spec.md | Work **Приёмка:** result |
+
+Seven columns; no pipes/newlines inside cells. Ownership: comma-separated
+literal relative file/directory paths (backticks optional), no globs.
+Dependencies: comma-separated IDs, or —. Sequential same-wave dependencies
+must reference earlier rows; parallel waves cannot have internal dependencies.
+Re-running an unchanged plan preserves ALL files and progress. Changed plans
+are refused once generated: archive/reconcile affected runs explicitly first.
 """
+import argparse
+import hashlib
+import json
+from pathlib import Path
 import re
-import pathlib
+import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
+# Project-specific configuration. Empty RUNS means automatic stage names.
+PLAN = 'docs/dev-plan.md'
+RUNS = {}  # e.g. {'0': ('run-0-foundation', 'Foundation')}
+DESIGN = set()
+HIGH_STAKES = set()  # subset of DESIGN; L tasks also get design automatically
+ALWAYS_CONTEXT = 'tasks/PROJECT.md; tasks/ORCHESTRATION.md'
 
-# ============ НАСТРОЙКА ПОД ПРОЕКТ ============
-PLAN = "docs/dev-plan.md"  # путь к плану задач от корня проекта
 
-# Этап → (имя папки рана, короткое имя). Ключи = номера этапов из плана.
-RUNS = {
-    "0": ("run-0-foundation", "Фундамент"),
-    "1": ("run-1-core", "Ядро"),
-    # "2": ("run-2-...", "..."),
-}
+def fail(message):
+    raise ValueError(message)
 
-# Задачи с дизайн-проходом deep-reasoner до реализации.
-# Критерии: L-размер, security, общие контракты/схемы, конкурентность,
-# core-механика (pipeline, state, версии данных).
-DESIGN = {
-    # "T0.1", "T0.2", ...
-}
 
-# High-stakes (адверсариальный дизайн deep-reasoner ∥ reviewer):
-# общие контракты, auth, изоляция данных, core wiring. Подмножество DESIGN.
-HIGH_STAKES = {
-    # "T0.2", ...
-}
+def ownership(value):
+    paths = [part.strip().strip('`').rstrip('/') for part in value.split(',')]
+    for path in paths:
+        if (not path or path.startswith(('/', '~')) or '\\' in path
+                or any(c in path for c in '*?[]') or any(c.isspace() for c in path)
+                or any(p in ('', '.', '..') for p in path.split('/'))):
+            fail(f'Invalid ownership path: {value}')
+    return paths
 
-# Контекст, который исполнитель читает всегда (помимо карточки).
-ALWAYS_CONTEXT = "план задач (см. CLAUDE.md → Sources of truth)"
-# ==============================================
 
-SRC = ROOT / PLAN
-OUT = ROOT / "tasks"
+def overlaps(left, right):
+    return any(a == b or a.startswith(b + '/') or b.startswith(a + '/')
+               for a in left for b in right)
 
-stage_re = re.compile(r"^## \d+\. Этап (\d+) — (.+)$")
-wave_re = re.compile(r"^### Волна (\S+) — (.+)$")
-gate_re = re.compile(r"^\*\*Gate[^:]*:\*\*\s*(.+)$")
-task_re = re.compile(r"^\| (T\d+\.\d+) \|")
 
-stages = {}
-stage = wave = None
-
-for line in SRC.read_text(encoding="utf-8").splitlines():
-    m = stage_re.match(line)
-    if m:
-        stage = m.group(1)
-        stages[stage] = {"title": m.group(2), "gate": "", "waves": []}
-        wave = None
-        continue
-    if stage is None:
-        continue
-    m = gate_re.match(line)
-    if m and not stages[stage]["gate"]:
-        stages[stage]["gate"] = m.group(1)
-        continue
-    m = wave_re.match(line)
-    if m:
-        wave = (m.group(1), m.group(2), [])
-        stages[stage]["waves"].append(wave)
-        continue
-    if task_re.match(line) and wave is not None:
-        cells = [c.strip() for c in line.split("|")[1:-1]]
-        if len(cells) != 7:
-            raise SystemExit(f"Bad row ({len(cells)} cells): {line[:80]}")
+def parse(text):
+    stages, tasks, stage, wave = [], {}, None, None
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        m = re.fullmatch(r'## \d+\. Этап (\d+) — (.+)', line)
+        if m:
+            if any(s['id'] == m[1] for s in stages):
+                fail(f'Line {number}: duplicate stage')
+            stage = dict(id=m[1], title=m[2], gate='', waves=[])
+            stages.append(stage)
+            wave = None
+            continue
+        m = re.fullmatch(r'\*\*Gate[^:]*:\*\*\s*(.+)', line)
+        if m:
+            if stage is None or stage['gate']:
+                fail(f'Line {number}: missing stage or duplicate gate')
+            stage['gate'] = m[1]
+            continue
+        m = re.fullmatch(r'### Волна (\S+) — (.+)', line)
+        if m:
+            if stage is None or not m[1].startswith(stage['id'] + '.'):
+                fail(f'Line {number}: wave outside its stage')
+            if any(w['id'] == m[1] for s in stages for w in s['waves']):
+                fail(f'Line {number}: duplicate wave')
+            if not re.match(r'^(последовательно|параллельно)\b', m[2]):
+                fail(f'Line {number}: unknown wave mode')
+            wave = dict(id=m[1], mode=m[2], tasks=[])
+            stage['waves'].append(wave)
+            continue
+        # Reject malformed structural headers rather than silently losing tasks.
+        if re.match(r'^##.*Этап|^###.*Волна', line):
+            fail(f'Line {number}: malformed stage/wave heading')
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if cells[0] == 'ID' or all(re.fullmatch(r'[: -]+', c) for c in cells):
+            continue
+        # Non-task tables outside waves are documentation; inside waves every row is a task.
+        if wave is None and not cells[0].startswith('T'):
+            continue
+        if stage is None or wave is None or len(cells) != 7:
+            fail(f'Line {number}: task outside wave or not seven columns')
         tid, name, size, deps, own, ctx, body = cells
-        if "**Приёмка:**" in body:
-            todo, accept = body.split("**Приёмка:**", 1)
-        else:
-            todo, accept = body, ""
-        wave[2].append({
-            "id": tid, "name": name, "size": size, "deps": deps,
-            "own": own, "ctx": ctx, "todo": todo.strip(),
-            "accept": accept.strip(),
-        })
+        if not re.fullmatch(r'T\d+\.\d+', tid) or tid.split('.')[0] != 'T' + stage['id']:
+            fail(f'Line {number}: invalid task ID {tid}')
+        if tid in tasks:
+            fail(f'Line {number}: duplicate {tid}')
+        if size not in ('S', 'M', 'L') or not name or not ctx or '**Приёмка:**' not in body:
+            fail(f'Line {number}: missing name/context/acceptance or invalid size')
+        todo, accept = body.split('**Приёмка:**', 1)
+        if not todo.strip() or not accept.strip():
+            fail(f'Line {number}: empty work or acceptance')
+        dependency_ids = [] if deps in ('—', '-') else [d.strip().strip('`') for d in deps.split(',')]
+        if any(not re.fullmatch(r'T\d+\.\d+', d) for d in dependency_ids):
+            fail(f'Line {number}: malformed dependencies')
+        task = dict(id=tid, name=name, size=size, deps=dependency_ids, own=ownership(own),
+                    ctx=ctx, todo=todo.strip(), accept=accept.strip(), stage=stage['id'],
+                    wave=wave['id'], mode=wave['mode'], order=len(tasks))
+        tasks[tid] = task
+        wave['tasks'].append(task)
+    if not tasks:
+        fail('No tasks found')
+    for s in stages:
+        if not s['gate'] or not s['waves'] or any(not w['tasks'] for w in s['waves']):
+            fail(f'Stage {s["id"]}: gate and nonempty waves required')
+    for task in tasks.values():
+        for dep in task['deps']:
+            if dep not in tasks:
+                fail(f'{task["id"]}: unknown dependency {dep}')
+    visiting, visited = set(), set()
+    def visit(tid):
+        if tid in visiting:
+            fail(f'Dependency cycle at {tid}')
+        if tid in visited:
+            return
+        visiting.add(tid)
+        for dep in tasks[tid]['deps']:
+            visit(dep)
+        visiting.remove(tid)
+        visited.add(tid)
+    for tid in tasks:
+        visit(tid)
+    for task in tasks.values():
+        for dep in task['deps']:
+            parent = tasks[dep]
+            if parent['order'] >= task['order']:
+                fail(f'{task["id"]}: dependency {dep} must appear earlier')
+            if parent['wave'] == task['wave'] and task['mode'].startswith('параллельно'):
+                fail(f'{task["id"]}: dependency inside parallel wave')
+    for s in stages:
+        for w in s['waves']:
+            if w['mode'].startswith('параллельно'):
+                for i, a in enumerate(w['tasks']):
+                    for b in w['tasks'][i + 1:]:
+                        if overlaps(a['own'], b['own']):
+                            fail(f'Ownership conflict: {a["id"]} / {b["id"]}')
+    if not HIGH_STAKES <= DESIGN or (DESIGN | HIGH_STAKES) - tasks.keys():
+        fail('HIGH_STAKES must be a subset of DESIGN; routing IDs must exist')
+    return stages, tasks
 
 
-def route_full(tid):
-    if tid in HIGH_STAKES:
-        return ("scout (контекст-пакет) → deep-reasoner ∥ reviewer "
-                "(адверсариальный дизайн, CLAUDE.md правило 2; синтез — оркестратор) → "
-                "fast-worker (реализация) → reviewer (приёмка)")
-    if tid in DESIGN:
-        return ("scout (контекст-пакет) → deep-reasoner (дизайн) → "
-                "fast-worker (реализация) → reviewer (приёмка)")
-    return "scout (контекст-пакет) → fast-worker (реализация) → reviewer (приёмка)"
+def render(stages, tasks):
+    files, index, names = {}, ['# Tasks\n\nRun in listed order; prior gate must pass.\n'], set()
+    for stage in stages:
+        sid = stage['id']
+        if RUNS and sid not in RUNS:
+            fail(f'Stage {sid} missing from RUNS')
+        dirname = RUNS[sid][0] if RUNS else f'run-{sid}'
+        if not re.fullmatch(r'run-[A-Za-z0-9_-]+', dirname) or dirname in names:
+            fail(f'Invalid or duplicate run directory: {dirname}')
+        names.add(dirname)
+        index.append(f'- [{dirname}: {stage["title"]}]({dirname}/README.md)')
+        lines = [f'# {dirname} — {stage["title"]}\n', f'**Gate:** {stage["gate"]}\n',
+                 'Claude: `/orchestrate ' + dirname + '`; Codex: `$orchestrate ' + dirname + '`\n',
+                 'Rules: `tasks/ORCHESTRATION.md`; project: `tasks/PROJECT.md`.\n']
+        for wave in stage['waves']:
+            lines.append(f'## Волна {wave["id"]} — {wave["mode"]}\n')
+            for t in wave['tasks']:
+                route = ('high-stakes: independent design + adversarial review' if t['id'] in HIGH_STAKES
+                         else 'design' if t['id'] in DESIGN or t['size'] == 'L' else 'standard')
+                lines.append(f'- [ ] {t["id"]} — [{t["name"]}]({t["id"]}.md) ({route})')
+                files[f'{dirname}/{t["id"]}.md'] = (
+                    f'# {t["id"]} — {t["name"]}\n\n'
+                    f'- Stage / wave: {sid} / {wave["id"]}\n- Size: {t["size"]}\n'
+                    f'- Dependencies: {", ".join(t["deps"]) or "—"}\n'
+                    f'- Ownership: {", ".join(t["own"])}\n- Context: {t["ctx"]}; {ALWAYS_CONTEXT}\n'
+                    f'- Route: {route} → fast-worker → independent reviewer; scout only if needed\n\n'
+                    f'## Сделать\n\n{t["todo"]}\n\n## Приёмка\n\n{t["accept"]}\n\n'
+                    'Follow tasks/ORCHESTRATION.md. Return changes and verification evidence; '
+                    'only the coordinator writes status/devlog.\n')
+        lines += ['\n## Gate status\n', '- [ ] Gate passed (evidence: gate-review.md)\n',
+                  '## Findings (coordinator, append-only)\n']
+        files[f'{dirname}/README.md'] = '\n'.join(lines)
+    files['README.md'] = '\n'.join(index) + '\n'
+    return files
 
 
-def route_label(tid):
-    if tid in HIGH_STAKES:
-        return "high-stakes дизайн"
-    if tid in DESIGN:
-        return "дизайн"
-    return "стандарт"
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Validate without writing')
+    args = parser.parse_args()
+    try:
+        stages, tasks = parse((ROOT / PLAN).read_text())
+        files = render(stages, tasks)
+        out = ROOT / 'tasks'
+        # Fingerprint generated immutable content, so plan/config changes cannot reset progress.
+        digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+        manifest = out / '.generation.json'
+        destinations = [out / name for name in files] + [manifest]
+        for path in destinations:
+            if any(p.is_symlink() for p in [path, *path.parents] if p != ROOT and ROOT in p.parents):
+                fail(f'Symlink destination: {path}')
+        if manifest.exists():
+            previous = json.loads(manifest.read_text())
+            if previous.get('digest') != digest:
+                fail('Plan/config changed. Existing runs preserved; reconcile/archive generated runs and manifest before regenerating.')
+            for name, expected in files.items():
+                path = out / name
+                if not path.is_file():
+                    fail(f'Missing generated file: {name}; restore it before continuing')
+                if path.name != 'README.md' and path.read_text() != expected:
+                    fail(f'Edited task card: {name}; reconcile with plan before continuing')
+            print(f'Unchanged: {len(tasks)} tasks; all progress preserved')
+            return 0
+        if any(path.exists() for path in destinations) or (out.exists() and any(out.glob('run-*'))):
+            fail('Existing generated/legacy files without matching manifest; nothing overwritten')
+        if not args.check:
+            for name, content in files.items():
+                path = out / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            manifest.write_text(json.dumps({'version': 1, 'digest': digest}, indent=2) + '\n')
+        print(f'{"Validated" if args.check else "Generated"}: {len(tasks)} tasks, {len(stages)} runs')
+        return 0
+    except (ValueError, OSError, RecursionError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
-TASK_TMPL = """# {id} — {name}
-
-- **Этап / волна:** {stage} / {wave} ({mode})
-- **Размер:** {size}
-- **Зависит:** {deps}
-- **Владение (менять можно только это):** {own}
-- **Контекст-пакет:** {ctx}
-  - плюс всегда: {always}
-- **Маршрут:** {route}
-
-## Сделать
-
-{todo}
-
-## Приёмка
-
-{accept}
-
-## Протокол исполнителя
-
-Только своя область владения; тесты обязательны (задача без зелёных тестов не сделана); без scope creep — смежные находки в `docs/devlog.md`. Если в брифе назван дизайн-файл `T*-design.md` — он обязателен к исполнению. По завершении: запись в devlog (3–5 строк) + краткий отчёт оркестратору (файлы, статус тестов, отклонения от брифа). Чекбокс статуса ставит только оркестратор — в README рана, после вердикта ACCEPT от reviewer.
-"""
-
-RUN_TMPL = """# Run {stage} — Этап {stage}: {title}
-
-**Gate (ран закрыт, когда):** {gate}
-
-**Задач:** {count} · один запуск оркестратора (Fable 5, effort high) на весь ран · правила: `CLAUDE.md`
-
-## Как запустить
-
-1. Терминал в корне проекта → `claude` → `/model` → Fable 5, Reasoning effort: High.
-2. `/orchestrate {dirname}` — команда сама определяет, старт это или продолжение после обрыва.
-
-{waves}
-## Статус (отмечает только оркестратор, после ACCEPT от reviewer)
-
-{status}
-
-### Обнаруженное в ходе рана (append-only)
-
-_(пусто)_
-"""
-
-OUT.mkdir(exist_ok=True)
-total = 0
-run_index = []
-
-for stage_num, info in stages.items():
-    if stage_num not in RUNS:
-        raise SystemExit(f"Этап {stage_num} есть в плане, но не описан в RUNS")
-    dirname, _short = RUNS[stage_num]
-    rdir = OUT / dirname
-    rdir.mkdir(exist_ok=True)
-
-    waves_md, status_md, count = [], [], 0
-    for wlabel, wmode, wtasks in info["waves"]:
-        waves_md.append(f"### Волна {wlabel} — {wmode}\n")
-        waves_md.append("| Задача | Размер | Зависит | Маршрут |")
-        waves_md.append("|---|---|---|---|")
-        for t in wtasks:
-            count += 1
-            total += 1
-            fname = f"{t['id']}.md"
-            (rdir / fname).write_text(TASK_TMPL.format(
-                stage=stage_num, wave=wlabel, mode=wmode, always=ALWAYS_CONTEXT,
-                route=route_full(t["id"]), **t), encoding="utf-8")
-            waves_md.append(
-                f"| [{t['id']} — {t['name']}]({fname}) | {t['size']} | "
-                f"{t['deps']} | {route_label(t['id'])} |")
-            status_md.append(f"- [ ] {t['id']} — {t['name']}")
-        waves_md.append("")
-
-    (rdir / "README.md").write_text(RUN_TMPL.format(
-        stage=stage_num, title=info["title"], gate=info["gate"],
-        count=count, dirname=dirname,
-        waves="\n".join(waves_md), status="\n".join(status_md)),
-        encoding="utf-8")
-    run_index.append((dirname, info["title"], count))
-
-index = ["# Tasks — раны оркестратора\n"]
-index.append(
-    f"Задачи плана `{PLAN}` разложены на **раны**: "
-    "один ран = один запуск сессии-оркестратора, границы ранов = gate'ы этапов "
-    "(пока gate не зелёный, следующий этап не начинается). Запускать строго по порядку.\n")
-index.append("| Ран | Этап | Задач | Статус |")
-index.append("|---|---|---|---|")
-for dirname, title, count in run_index:
-    index.append(f"| [{dirname}]({dirname}/README.md) | {title} | {count} | см. README рана |")
-index.append("""
-## Как это устроено
-
-- **README рана** — оперативный план оркестратора: волны, маршруты, чеклист «Статус» (источник правды по прогрессу).
-- **Карточка задачи (`T*.md`)** — самодостаточный бриф: владение, контекст-пакет, приёмка, маршрут агентов. Сабагенту показывают только его карточку, не весь план.
-- **Маршруты:** «стандарт» — scout → fast-worker → reviewer; «дизайн» — плюс deep-reasoner до реализации (L-задачи, security, конкурентность); «high-stakes дизайн» — дизайн прогоняется адверсариально (deep-reasoner ∥ reviewer): контракты, auth, изоляция данных, core wiring. Дизайн сохраняется в `T<ID>-design.md` рядом с карточкой.
-- Требования и полный контекст остаются в плане и PRD — карточки из них сгенерированы и при расхождении проигрывают плану.
-""")
-(OUT / "README.md").write_text("\n".join(index), encoding="utf-8")
-
-for stage_num, info in stages.items():
-    n = sum(len(w[2]) for w in info["waves"])
-    print(f"Этап {stage_num}: {n} задач, {len(info['waves'])} волн — {RUNS[stage_num][0]}")
-print(f"Всего: {total} задач")
+if __name__ == '__main__':
+    sys.exit(main())

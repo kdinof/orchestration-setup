@@ -1,58 +1,107 @@
 # orchestration-setup
 
-Claude Code skill: разворачивает в проекте готовую инфраструктуру мультиагентной оркестрации.
+Скилл настройки мультиагентной разработки для **Claude Code и Codex**.
+Общий протокол: план → задачи с зависимостями → реализация → независимая
+приёмка → интеграционный gate → сохранение проверенных решений.
 
-Главная сессия работает как оркестратор-тимлид, реализацию делают сабагенты на закреплённых моделях, задачи выполняются «ранами» по 10–20 штук с недоверчивой приёмкой каждой.
+## Установка скилла настройки
 
-## Что ставит скилл
-
-```
-.claude/agents/        scout (Haiku), fast-worker (Sonnet), deep-reasoner (Opus), reviewer (Opus)
-.claude/commands/      /orchestrate — запуск/продолжение рана
-tasks/_generate.py     нарезает план задач на раны; tasks/run-*/ — карточки и статусы
-docs/devlog.md         append-only журнал агентов
-CLAUDE.md              + секция Orchestration workflow (роли, правила, протокол рана)
-```
-
-## Установка
-
-Пользовательский уровень (доступен во всех проектах):
+Нужен Python 3.9+; внешних Python-зависимостей нет.
 
 ```bash
-git clone https://github.com/kdinof/orchestration-setup.git ~/.claude/skills/orchestration-setup
+git clone https://github.com/kdinof/orchestration-setup.git
+cd orchestration-setup
+# Для обоих хостов в выбранном проекте:
+python3 scripts/install.py skill --target both --project /path/to/project
+# Или персональная установка:
+python3 scripts/install.py skill --target both --user
 ```
 
-Уровень проекта:
+Можно выбрать `--target claude` или `--target codex`. Предпросмотр: `--dry-run`.
+
+| Хост | Проект | Персонально | Вызов настройки |
+|---|---|---|---|
+| Claude Code | `.claude/skills/orchestration-setup` | `~/.claude/skills/orchestration-setup` | `/orchestration-setup` |
+| Codex | `.agents/skills/orchestration-setup` | `~/.agents/skills/orchestration-setup` | `$orchestration-setup` |
+
+Совместим и прежний способ `git clone` прямо в каталог скилла Claude.
+Установщик копирует самодостаточный пакет, исходный checkout после установки
+не требуется. Обновление одинаковых файлов — no-op; отличающиеся файлы требуют
+согласования показанного diff. Не устанавливай одну версию сразу в несколько
+областей одного хоста без необходимости — возможны дубликаты.
+
+## Настройка проекта
+
+Скажи агенту: «Настрой оркестрацию для Claude и Codex в этом проекте».
+Либо создай инфраструктуру напрямую из checkout:
 
 ```bash
-git clone https://github.com/kdinof/orchestration-setup.git .claude/skills/orchestration-setup
+python3 scripts/install.py setup --target both --project /path/to/project --dry-run
+python3 scripts/install.py setup --target both --project /path/to/project
 ```
 
-Перезапусти Claude Code — скилл появится в списке доступных.
+Будут созданы:
 
-## Использование
+- Claude: `.claude/agents/*.md`, `.claude/commands/orchestrate.md`, секция `CLAUDE.md`.
+- Codex: `.codex/agents/*.toml`, `.agents/skills/orchestrate/`, секция `AGENTS.md`.
+- Общее: `tasks/ORCHESTRATION.md`, `tasks/PROJECT.md`, `tasks/roles/`,
+  `tasks/_generate.py`, `docs/devlog.md`.
 
-Скажи в проекте что-то вроде «настрой оркестрацию» / «разверни мультиагентную разработку» — скилл подхватится сам. Дальше:
+Заполни `tasks/PROJECT.md` и настрой генератор. План должен содержать ID,
+размер, зависимости, владение, контекст, проверяемую приёмку и gate этапа.
+[Пример плана](references/example-plan.md), [методика](references/BACKLOG.md).
 
 ```bash
-claude                        # в корне проекта
-/model                        # оркестратору нужна сильная модель + Reasoning effort: High
-/orchestrate run-0-<имя>      # или без аргумента — первый незакрытый ран
+# В целевом проекте после подготовки плана:
+python3 tasks/_generate.py --check
+python3 tasks/_generate.py
 ```
 
-## Предусловие
+Запуск в Claude: `/orchestrate run-0`; в Codex: `$orchestrate run-0`.
+Без имени выбирается первый ран с незакрытыми задачами **или gate**.
+Если новые роли не появились, перезапусти хост.
 
-Оркестрации нужен план задач, где у каждой задачи есть ID, размер S/M/L, зависимости, владение файлами, контекст-файлы и проверяемая приёмка; задачи сгруппированы в волны, этапы закрыты gate'ами. Если плана нет — скилл поможет его составить (методика в `references/BACKLOG.md`).
+## Что изменилось
 
-## Инварианты
+- Установка проверяет конфликты до записи и не сбрасывает локальные настройки.
+- Генерация проверяет структуру и зависимости, сохраняет прогресс повторного запуска.
+- Параллельные исполнители работают в отдельных worktrees; статус и devlog
+  записывает только координатор. Без изоляции реализация последовательная.
+- Scout вызывается по необходимости. Лимит 3 относится ко всем активным
+  сабагентам. Повторы ограничены, ревью и gate требуют сохранённых доказательств.
+- Проверенные нетривиальные решения попадают в `docs/solutions/` и используются
+  в следующих задачах — подход исследован на примере Every Compound Engineering.
 
-1. Оркестратор не кодит.
-2. Бриф самодостаточен — сабагент не видит разговора.
-3. Состояние живёт в файлах, а не в контексте сессии.
-4. Приёмка недоверчива: reviewer с чистым контекстом сам гоняет тесты.
-5. Параллель ≤3 и только непересекающееся владение файлами.
-6. Модели не меняются ролями.
+[Исследование, источники и компромиссы](references/RESEARCH.md).
+[Различия хостов и миграция старых установок](references/RUNTIMES.md).
 
-## Лицензия
+Это набор инструкций и скриптов, а не автономный планировщик: соблюдение runtime
+протокола зависит от агента. Codex по умолчанию наследует модель сессии;
+для распределения моделей доступен профиль `balanced` или своя JSON-таблица.
+Без сабагентов нельзя заявлять независимую приёмку. Изменение уже сгенерированного
+плана требует ручного согласования состояния; автоматического merge статусов нет.
 
-MIT — см. [LICENSE](LICENSE).
+## Проверки
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+MIT — [LICENSE](LICENSE).
+
+## Модели по ролям в Codex
+
+```bash
+python3 scripts/install.py setup --target codex --project /path/to/project --codex-profile balanced
+```
+
+Профиль: scout — Luna/low, fast-worker — Terra/medium, deep-reasoner и reviewer —
+Astra/high. Модель главной сессии не меняется. Без флага остаётся наследование.
+Для своих моделей: `--codex-models /path/to/models.json`; за основу возьми
+[пример](references/codex-balanced.json). Предпросмотр и защита конфликтов работают
+так же, как при обычной установке. Подробности и миграция —
+[RUNTIMES.md](references/RUNTIMES.md#model-routing).
+
+Профиль не проверяет доступ к моделям твоего аккаунта и не гарантирует экономию.
+Перед первым раном нужно проверить фактическую модель сабагентов; сравнивать
+стоимость/время следует с учётом повторных попыток и возвратов с review.
