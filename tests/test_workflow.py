@@ -245,5 +245,82 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(snapshot(other), {})
 
 
+    # --- Claude guard hook -------------------------------------------------
+
+    def hook(self, event, **env):
+        import os
+        proc = subprocess.run([sys.executable, str(self.root / '.claude/hooks/orch_guard.py')],
+                              input=json.dumps(event), capture_output=True, text=True,
+                              env={**os.environ, 'CLAUDE_PROJECT_DIR': str(self.root), **env})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+    def test_claude_hooks_merge_preserves_settings(self):
+        settings = self.root / '.claude/settings.json'
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({'permissions': {'allow': ['Bash(ls)']},
+                                        'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'x'}]}]}}))
+        self.install(target='claude')
+        data = json.loads(settings.read_text())
+        self.assertEqual(data['permissions'], {'allow': ['Bash(ls)']})
+        self.assertEqual(len(data['hooks']['Stop']), 1)
+        for event in ('PreToolUse', 'PostToolUse', 'SubagentStart', 'SubagentStop'):
+            self.assertEqual(len(data['hooks'][event]), 1)
+        self.assertTrue((self.root / '.claude/hooks/orch_guard.py').exists())
+        before = snapshot(self.root)
+        self.install(target='claude')
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_no_claude_hooks_and_invalid_settings(self):
+        self.install('--no-claude-hooks', target='claude')
+        self.assertFalse((self.root / '.claude/hooks').exists())
+        self.assertFalse((self.root / '.claude/settings.json').exists())
+        self.install('--no-claude-hooks', target='codex', ok=False)
+        (self.root / '.claude/settings.json').write_text('{broken')
+        before = snapshot(self.root)
+        self.install(target='claude', ok=False)
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_guard_hook_enforces_coordinator_rules(self):
+        self.install(target='claude')
+        self.prepare()
+        self.generate()
+        readme = self.root / 'tasks/run-0/README.md'
+        def edit(path, old='a', new='b', **extra):
+            return self.hook({'hook_event_name': 'PreToolUse', 'tool_name': 'Edit',
+                              'tool_input': {'file_path': str(path), 'old_string': old,
+                                             'new_string': new}, **extra})
+        tick = dict(path=readme, old='- [ ] T0.1', new='- [x] T0.1')
+        src = self.root / 'src/health.py'
+        self.assertIsNone(edit(src))  # no active run: ordinary sessions unaffected
+        (self.root / 'tasks/.active-run').write_text('run-0')
+        self.assertEqual(edit(src)['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertIsNone(edit(src, agent_id='a1', agent_type='fast-worker'))
+        self.assertIsNone(edit(self.root / 'tasks/run-0/T0.1-progress.md'))
+        self.assertIsNotNone(edit(**tick))
+        self.hook({'hook_event_name': 'SubagentStop', 'agent_id': 'r1', 'agent_type': 'reviewer',
+                   'last_assistant_message': '**Task:** T0.1 · **Verdict: RETURN**\n1. gap'})
+        self.assertIsNotNone(edit(**tick))
+        self.hook({'hook_event_name': 'SubagentStop', 'agent_id': 'r2', 'agent_type': 'reviewer',
+                   'last_assistant_message': '**Task:** T0.1 · **Verdict: ACCEPT**\n1. ok'})
+        self.assertIsNone(edit(**tick))
+        self.assertIsNotNone(edit(self.root / 'tasks/.orch/verdicts.jsonl'))
+        import os
+        proc = subprocess.run([sys.executable, str(self.root / '.claude/hooks/orch_guard.py'), 'report'],
+                              capture_output=True, text=True,
+                              env={**os.environ, 'CLAUDE_PROJECT_DIR': str(self.root)})
+        self.assertIn('first-pass ACCEPT: 0/1', proc.stdout)
+
+    def test_cross_wave_conflict_and_rulings(self):
+        self.prepare(PLAN + '\n### Волна 0.3 — параллельно\n\n'
+                     '| ID | Задача | Размер | Зависит | Владение | Контекст | Сделать / Приёмка |\n'
+                     '|---|---|---|---|---|---|---|\n'
+                     '| T0.4 | Docs | S | T0.1 | `src/health.py` | docs/api.md | Doc. **Приёмка:** ok. |\n')
+        self.generate()
+        run = self.root / 'tasks/run-0'
+        self.assertIn('Not parallel with: T0.4', (run / 'T0.2.md').read_text())
+        self.assertIn('Not parallel with: —', (run / 'T0.3.md').read_text())
+        self.assertIn('## Rulings', (run / 'README.md').read_text())
+
 if __name__ == '__main__':
     unittest.main()

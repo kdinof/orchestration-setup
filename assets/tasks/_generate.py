@@ -14,6 +14,9 @@ Dependencies: comma-separated IDs, or —. Sequential same-wave dependencies
 must reference earlier rows; parallel waves cannot have internal dependencies.
 Re-running an unchanged plan preserves ALL files and progress. Changed plans
 are refused once generated: archive/reconcile affected runs explicitly first.
+Tasks of one stage that share ownership but are neither in the same wave nor
+ordered by dependencies get "Not parallel with" so the coordinator can dispatch
+by readiness (waves are not barriers) without two writers on one path.
 """
 import argparse
 import hashlib
@@ -151,8 +154,30 @@ def parse(text):
     return stages, tasks
 
 
+def exclusions(tasks):
+    """Same-stage tasks from different waves that overlap in ownership and are not ordered by deps."""
+    ancestors = {}
+    def up(tid):
+        if tid not in ancestors:
+            ancestors[tid] = set()
+            for dep in tasks[tid]['deps']:
+                ancestors[tid] |= {dep} | up(dep)
+        return ancestors[tid]
+    result = {tid: [] for tid in tasks}
+    ordered = sorted(tasks.values(), key=lambda t: t['order'])
+    for i, a in enumerate(ordered):
+        for b in ordered[i + 1:]:
+            if (a['stage'] == b['stage'] and a['wave'] != b['wave']
+                    and a['id'] not in up(b['id']) and b['id'] not in up(a['id'])
+                    and overlaps(a['own'], b['own'])):
+                result[a['id']].append(b['id'])
+                result[b['id']].append(a['id'])
+    return result
+
+
 def render(stages, tasks):
     files, index, names = {}, ['# Tasks\n\nRun in listed order; prior gate must pass.\n'], set()
+    excluded = exclusions(tasks)
     for stage in stages:
         sid = stage['id']
         if RUNS and sid not in RUNS:
@@ -170,17 +195,22 @@ def render(stages, tasks):
             for t in wave['tasks']:
                 route = ('high-stakes: independent design + adversarial review' if t['id'] in HIGH_STAKES
                          else 'design' if t['id'] in DESIGN or t['size'] == 'L' else 'standard')
-                lines.append(f'- [ ] {t["id"]} — [{t["name"]}]({t["id"]}.md) ({route})')
+                conflicts = ', '.join(excluded[t['id']]) or '—'
+                suffix = f'; not parallel with {conflicts}' if excluded[t['id']] else ''
+                lines.append(f'- [ ] {t["id"]} — [{t["name"]}]({t["id"]}.md) ({route}{suffix})')
                 files[f'{dirname}/{t["id"]}.md'] = (
                     f'# {t["id"]} — {t["name"]}\n\n'
                     f'- Stage / wave: {sid} / {wave["id"]}\n- Size: {t["size"]}\n'
                     f'- Dependencies: {", ".join(t["deps"]) or "—"}\n'
-                    f'- Ownership: {", ".join(t["own"])}\n- Context: {t["ctx"]}; {ALWAYS_CONTEXT}\n'
+                    f'- Ownership: {", ".join(t["own"])}\n- Not parallel with: {conflicts}\n'
+                    f'- Context: {t["ctx"]}; {ALWAYS_CONTEXT}\n'
                     f'- Route: {route} → fast-worker → independent reviewer; scout only if needed\n\n'
                     f'## Сделать\n\n{t["todo"]}\n\n## Приёмка\n\n{t["accept"]}\n\n'
                     'Follow tasks/ORCHESTRATION.md. Return changes and verification evidence; '
                     'only the coordinator writes status/devlog.\n')
         lines += ['\n## Gate status\n', '- [ ] Gate passed (evidence: gate-review.md)\n',
+                  '## Rulings (coordinator, append-only)\n',
+                  '`R<n> · T<ID> · decision · why · cost if wrong: low/medium/high · reversible: yes/no`\n',
                   '## Findings (coordinator, append-only)\n']
         files[f'{dirname}/README.md'] = '\n'.join(lines)
     files['README.md'] = '\n'.join(index) + '\n'
