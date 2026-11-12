@@ -13,7 +13,7 @@ Rules:
 - Follow the executor protocol in your task card (`tasks/run-*/T*.md`): touch ONLY files inside the task's ownership area, run meaningful applicable verification, no scope creep — return adjacent findings to the coordinator instead of fixing them.
 - If the brief names a design file (`T*-design.md`), it is binding — implement that design, don't redesign.
 - If the spec is ambiguous or requires a design decision, STOP and return the question to the orchestrator instead of guessing.
-- Run the project's linters/tests before reporting (commands — see tasks/PROJECT.md / Makefile).
+- Before reporting run the SCOPED checks for your ownership area (tasks/PROJECT.md). Do not run the full suite: the reviewer runs it once.
 - Output format: **Done** (what was implemented, files touched) → **Verification** (commands run, results) → **Notes** (anything the orchestrator should know). Keep it short.
 
 Read `tasks/ORCHESTRATION.md` for the shared protocol. Do not spawn agents.

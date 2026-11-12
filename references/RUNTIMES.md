@@ -9,6 +9,44 @@ deep-reasoner=opus/xhigh, reviewer=opus/high. Aliases are preferences, not
 immutable model versions; check actual model/effort support before dispatch.
 Do not assume built-in Explore always inherits an expensive main model.
 
+### Guard hook
+
+`setup --target claude|both` installs `.claude/hooks/orch_guard.py` and adds it
+to `.claude/settings.json` (PreToolUse on Edit/Write/MultiEdit/NotebookEdit/Bash,
+PostToolUse on SubagentHandback/Bash, PostToolUseFailure on Bash, SubagentStart,
+SubagentStop). The merge only
+adds missing entries and keeps every other setting; `--no-claude-hooks` skips
+both the file and the settings change. Hooks of a project run only after the
+user accepts the folder trust dialog.
+
+While `tasks/.active-run` exists, the hook denies main-session file edits outside
+`tasks/`, `docs/devlog.md` and `docs/solutions/` (subagent calls carry `agent_id`
+and are not restricted by it). It records reviewer verdicts from the first report
+line (`**Task:** T<ID> · **Verdict: …**`) in `tasks/.orch/verdicts.jsonl` and
+denies a README checkbox whose last recorded verdict is not ACCEPT. It records
+per-agent model, tokens, duration and tool calls in `tasks/.orch/metrics.jsonl`;
+`python3 .claude/hooks/orch_guard.py report [run]` summarizes them with
+first-pass acceptance. Limits: Bash writes are not intercepted; ownership of a
+worker's edits is still checked by the reviewer; token totals come from the
+subagent transcript and are best effort. The owner can lift the edit guard for
+an authorized single-agent fallback with `ORCH_ALLOW_MAIN_EDITS=1`. A stale
+`tasks/.active-run` after an aborted run must be deleted by the owner.
+
+Checks. `tasks/checks.json` (create-only) holds `full` — the exact full-check
+commands — and `test_patterns` used to recognize scoped checks for measurement.
+With `full` empty only measurement works. The hook denies a full command from
+fast-worker. Before a full run it fingerprints the working tree (temporary git
+index + `write-tree`; the real index is untouched; `tasks/`, `docs/devlog.md`,
+`docs/solutions/` are excluded) and denies a rerun when the same command already
+passed on that tree, quoting the earlier result. Only plain foreground runs are
+cached (`cd dir && <full> 2>&1` is fine; pipes, `||`, chains and background runs
+are not, because they can mask the exit code or finish later). A pass is the
+`PostToolUse` event, a failure `PostToolUseFailure`; failures are never reused.
+The fingerprint covers code, not environment: prefix the command with
+`ORCH_RERUN=1` after changing services, data or env, or for flaky suites. Keep
+test artifacts git-ignored, otherwise they change the fingerprint. The report
+shows check time per role, its share of subagent time and minutes saved.
+
 ## Codex
 
 Setup/runtime skills use `.agents/skills/` (or `~/.agents/skills/`).
@@ -88,6 +126,11 @@ Role prompts are behavioral constraints, not sandbox enforcement.
 6. An unchanged plan rerun preserves README progress and other artifacts. Missing
    generated files or manually edited cards fail validation instead of being
    silently repaired. Restore the file or follow the reconciliation process.
+7. Generators older than the Rulings / "Not parallel with" release render
+   different cards, so after updating `tasks/_generate.py` an existing run's
+   manifest no longer matches. Finish or archive the run first (step 5), or keep
+   the old generator until the run closes. The guard hook can be added to an
+   existing Claude setup on its own: rerun setup and reconcile the displayed diff.
 
 The generator validates literal ownership paths, not semantic interactions.
 Only comma-separated repository-relative paths are supported; no globs, spaces
