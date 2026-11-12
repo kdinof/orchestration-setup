@@ -15,6 +15,17 @@ and wired in .claude/settings.json. Codex is not affected.
   SubagentStop              → метрики (модель, токены, время, вызовы) + вердикт reviewer.
   PostToolUse SubagentHandback (reviewer) → вердикт, если отчёт сдан через handback.
 
+  Проверки (tasks/checks.json: "full" — точные команды полного набора,
+  "test_patterns" — признаки тестовых команд):
+  PreToolUse Bash
+      4. fast-worker не запускает полный набор — только scoped-проверки своей области.
+      5. Полный набор, уже прошедший на том же состоянии кода (отпечаток рабочего
+         дерева через временный git-индекс), не перезапускается: хук отдаёт
+         сохранённый результат. Повтор при flaky/смене окружения — префикс
+         ORCH_RERUN=1 в команде. Кэшируются только чистые foreground-запуски
+         (без пайпов: `make test | tail` маскирует код возврата).
+  PostToolUse / PostToolUseFailure Bash → журнал проверок: кто, что, время, итог.
+
 Активный ран = файл tasks/.active-run (имя папки рана). Его создаёт /orchestrate
 на старте и удаляет при закрытии рана. Нет файла → охрана редактирования выключена
 (обычные сессии в проекте не мешаются), метрики и вердикты пишутся всё равно.
@@ -36,10 +47,15 @@ TASKS = ROOT / "tasks"
 ORCH = TASKS / ".orch"
 METRICS = ORCH / "metrics.jsonl"
 VERDICTS = ORCH / "verdicts.jsonl"
+CHECKS = ORCH / "checks.jsonl"
+CHECKS_CONFIG = TASKS / "checks.json"
 ACTIVE = TASKS / ".active-run"
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 REVIEWER = "reviewer"
+WORKER = "fast-worker"
+RERUN = "ORCH_RERUN=1"
+COORDINATOR_PATHS = ("tasks", "docs/devlog.md", "docs/solutions")
 TASK_ID = re.compile(r"\bT\d+\.\d+\b")
 VERDICT = re.compile(r"Verdict\W{0,6}(ACCEPT|RETURN|BLOCKED)\b", re.I)
 CHECKED = re.compile(r"^\s*- \[[xX]\] (T\d+\.\d+)\b", re.M)
@@ -121,6 +137,9 @@ def last_verdict(tid):
 
 def pre_tool_use(ev):
     tool = ev.get("tool_name")
+    if tool == "Bash":
+        pre_bash(ev)
+        return
     if tool not in EDIT_TOOLS or ev.get("agent_id"):
         return  # subagents are governed by their own role files + reviewer
     inp = ev.get("tool_input") or {}
@@ -158,6 +177,121 @@ def pre_tool_use(ev):
          "(конфликт при интеграции — тоже задача для fast-worker). "
          "Не снимай tasks/.active-run, чтобы обойти правило: если правка правда "
          "нужна от главной сессии — спроси владельца проекта.")
+
+
+# ---------- checks: measure, keep the full suite to its owner, cache by tree ----------
+
+def checks_config():
+    try:
+        cfg = json.loads(CHECKS_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    norm = lambda c: " ".join(str(c).split())
+    return ({norm(c) for c in cfg.get("full") or [] if str(c).strip()},
+            [str(p) for p in cfg.get("test_patterns") or [] if str(p).strip()])
+
+
+def strip_redirects(segment):
+    return " ".join(re.sub(r"(\s+\d?>>?&?\s*\S+)+\s*$", "", segment).split())
+
+
+def classify(command):
+    """('full' | 'scoped' | None, cacheable) for a Bash command."""
+    full, patterns = checks_config()
+    cmd = " ".join(command.replace(RERUN, " ").split())
+    segments = [strip_redirects(s) for s in re.split(r"&&|\|\||;|\|", cmd) if s.strip()]
+    if full and any(seg in full for seg in segments):
+        rest = cmd
+        cd = r"^cd\s+(\"[^\"]*\"|'[^']*'|\S+)\s*&&\s*"  # leading `cd dir &&` is harmless
+        while re.match(cd, rest):
+            rest = re.sub(cd, "", rest, count=1)
+        cacheable = not re.search(r"&&|\|\||;|\|", rest) and strip_redirects(rest) in full
+        return "full", cacheable
+    if any(re.search(r"(^|[\s/])" + re.escape(p) + r"(\s|$)", cmd) for p in patterns):
+        return "scoped", False
+    return None, False
+
+
+def tree_fingerprint(cwd):
+    """Hash of the working tree incl. untracked files, without touching the real index."""
+    import shutil
+    import subprocess
+    import tempfile
+    try:
+        run = lambda *a, **kw: subprocess.run(["git", *a], cwd=cwd, capture_output=True,
+                                              text=True, timeout=40, check=True, **kw).stdout.strip()
+        index = pathlib.Path(run("rev-parse", "--git-path", "index"))
+        index = index if index.is_absolute() else pathlib.Path(cwd) / index
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_index = os.path.join(tmp, "index")
+            if index.exists():
+                shutil.copyfile(index, tmp_index)
+            env = {**os.environ, "GIT_INDEX_FILE": tmp_index}
+            # Coordinator workspace (run READMEs, hook journals, devlog) changes constantly
+            # and does not affect checks — keep it out of the fingerprint.
+            run("add", "-A", "--", ".", *(":(exclude)" + x for x in COORDINATOR_PATHS), env=env)
+            return run("write-tree", env=env)
+    except Exception:
+        return None
+
+
+def pre_bash(ev):
+    command = (ev.get("tool_input") or {}).get("command") or ""
+    kind, cacheable = classify(command)
+    if kind != "full":
+        return
+    agent = ev.get("agent_type") or "coordinator"
+    if agent == WORKER:
+        append(CHECKS, {"event": "denied", "reason": "worker-full", "ts": time.time(),
+                        "agent_type": agent, "run": active_run(), "command": command[:200]})
+        deny("Полный набор проверок гоняет reviewer (один раз на задачу). fast-worker "
+             "запускает только scoped-проверки своей области владения — команда в "
+             "tasks/PROJECT.md. Запусти их и опиши результат в отчёте.")
+    if not cacheable or ev.get("tool_input", {}).get("run_in_background"):
+        return
+    fp = tree_fingerprint(ev.get("cwd") or str(ROOT))
+    if not fp:
+        return
+    norm = strip_redirects(" ".join(command.replace(RERUN, " ").split()).split("&&")[-1])
+    append(CHECKS, {"event": "pending", "tool_use_id": ev.get("tool_use_id"), "fp": fp,
+                    "command": norm})
+    if RERUN in command:
+        return
+    hit = next((r for r in reversed(read_jsonl(CHECKS)) if r.get("event") == "check"
+                and r.get("fp") == fp and r.get("command") == norm and r.get("status") == "pass"),
+               None)
+    if hit:
+        append(CHECKS, {"event": "denied", "reason": "cache", "ts": time.time(),
+                        "agent_type": agent, "run": active_run(), "command": norm,
+                        "fp": fp, "saved_s": hit.get("duration_s")})
+        deny(f"«{norm}» уже прошёл на этом же состоянии кода (дерево {fp[:12]}, "
+             f"{time.strftime('%H:%M', time.localtime(hit.get('ts', 0)))}, "
+             f"{hit.get('agent_type')}, {hit.get('duration_s')} с). Код не менялся — используй "
+             "этот результат и укажи в отчёте «full checks: PASS (cached, tree "
+             f"{fp[:12]})». Если повтор действительно нужен (flaky, другое окружение), "
+             f"запусти с префиксом {RERUN}.")
+
+
+def post_bash(ev, ok):
+    command = (ev.get("tool_input") or {}).get("command") or ""
+    kind, _ = classify(command)
+    if not kind:
+        return
+    if (ev.get("tool_input") or {}).get("run_in_background"):
+        status = "background"
+    elif ok:
+        status = "pass"
+    else:
+        status = "interrupted" if ev.get("is_interrupt") else "fail"
+    pending = next((r for r in reversed(read_jsonl(CHECKS)) if r.get("event") == "pending"
+                    and r.get("tool_use_id") == ev.get("tool_use_id")), None) if kind == "full" else None
+    ms = ev.get("duration_ms")
+    append(CHECKS, {"event": "check", "ts": time.time(), "kind": kind, "status": status,
+                    "agent_type": ev.get("agent_type") or "coordinator", "run": active_run(),
+                    "duration_s": round(ms / 1000, 1) if isinstance(ms, (int, float)) else None,
+                    "command": pending["command"] if pending else command[:200],
+                    "fp": pending["fp"] if pending else None,
+                    "forced": RERUN in command})
 
 
 # ---------- metrics & verdicts ----------
@@ -230,17 +364,49 @@ def subagent_stop(ev):
 
 
 def post_tool_use(ev):
+    if ev.get("tool_name") == "Bash":
+        post_bash(ev, ok=True)
+        return
     if ev.get("tool_name") == "SubagentHandback" and ev.get("agent_type") == REVIEWER:
         record_verdict((ev.get("tool_input") or {}).get("message"), ev.get("agent_id"), "handback")
 
 
 # ---------- report ----------
 
+def report_checks(run, agent_seconds):
+    rows = [r for r in read_jsonl(CHECKS) if run is None or r.get("run") == run]
+    checks = [r for r in rows if r.get("event") == "check"]
+    denied = [r for r in rows if r.get("event") == "denied"]
+    if not checks and not denied:
+        print("Проверок пока не было (или tasks/checks.json не заполнен).")
+        return
+    print("Проверки (тесты/линтеры)")
+    print(f"{'кто':<16}{'вид':<8}{'запусков':>9}{'fail':>6}{'мин':>8}")
+    agg = {}
+    for r in checks:
+        a = agg.setdefault((r.get("agent_type"), r.get("kind")), [0, 0, 0.0])
+        a[0] += 1
+        a[1] += r.get("status") == "fail"
+        a[2] += r.get("duration_s") or 0
+    for (who, kind), (n, fails, sec) in sorted(agg.items(), key=lambda kv: -kv[1][2]):
+        print(f"{who:<16}{kind:<8}{n:>9}{fails:>6}{sec / 60:>8.1f}")
+    total = sum(r.get("duration_s") or 0 for r in checks)
+    share = f" ≈ {100 * total / agent_seconds:.0f}% времени сабагентов" if agent_seconds else ""
+    cache = [r for r in denied if r.get("reason") == "cache"]
+    saved = sum(r.get("saved_s") or 0 for r in cache)
+    print(f"Всего на проверки: {total / 60:.1f} мин{share}. "
+          f"Повторов отклонено кэшем: {len(cache)} (≈{saved / 60:.1f} мин сэкономлено); "
+          f"полных прогонов fast-worker отклонено: "
+          f"{sum(1 for r in denied if r.get('reason') == 'worker-full')}; "
+          f"принудительных повторов: {sum(1 for r in checks if r.get('forced'))}.")
+
+
 def report(run=None):
     rows = [r for r in read_jsonl(METRICS) if r.get("event") == "stop"
             and (run is None or r.get("run") == run)]
     if not rows:
-        print("Метрик пока нет" + (f" для {run}" if run else "") + ".")
+        print("Метрик агентов пока нет" + (f" для {run}" if run else "") + ".")
+        report_checks(run, 0)
         return
     agg = {}
     for r in rows:
@@ -266,6 +432,8 @@ def report(run=None):
     fp = sum(1 for verdict in first.values() if verdict == "ACCEPT")
     print(f"Вердиктов reviewer: {len(verdicts)} (RETURN: {ret}); "
           f"first-pass ACCEPT: {fp}/{len(first)} задач")
+    print()
+    report_checks(run, sum(a["sec"] for a in agg.values()))
 
 
 def main():
@@ -278,6 +446,7 @@ def main():
         return
     handler = {"PreToolUse": pre_tool_use, "SubagentStart": subagent_start,
                "SubagentStop": subagent_stop, "PostToolUse": post_tool_use,
+               "PostToolUseFailure": lambda e: e.get("tool_name") == "Bash" and post_bash(e, ok=False),
                }.get(ev.get("hook_event_name"))
     if handler:
         handler(ev)

@@ -12,6 +12,9 @@ Before dispatch write the run folder name to `tasks/.active-run`; delete it when
 the run closes or stops at its boundary. While it exists the guard hook
 (`.claude/hooks/orch_guard.py`) denies coordinator edits outside `tasks/`,
 `docs/devlog.md` and `docs/solutions/`, and denies a task checkbox without a
-recorded reviewer ACCEPT. A denial means delegate, not work around it. Launch
+recorded reviewer ACCEPT. It also keeps the full checks (`tasks/checks.json`)
+away from fast-worker and refuses to rerun them on an unchanged tree that
+already passed — reuse that result after integration. A denial means delegate
+or reuse, not work around it. Launch
 children with `run_in_background` and react to each completion. Include
 `python3 .claude/hooks/orch_guard.py report` in wave and run-close summaries.

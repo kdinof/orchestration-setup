@@ -264,7 +264,7 @@ class WorkflowTests(unittest.TestCase):
         data = json.loads(settings.read_text())
         self.assertEqual(data['permissions'], {'allow': ['Bash(ls)']})
         self.assertEqual(len(data['hooks']['Stop']), 1)
-        for event in ('PreToolUse', 'PostToolUse', 'SubagentStart', 'SubagentStop'):
+        for event in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStart', 'SubagentStop'):
             self.assertEqual(len(data['hooks'][event]), 1)
         self.assertTrue((self.root / '.claude/hooks/orch_guard.py').exists())
         before = snapshot(self.root)
@@ -321,6 +321,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('Not parallel with: T0.4', (run / 'T0.2.md').read_text())
         self.assertIn('Not parallel with: —', (run / 'T0.3.md').read_text())
         self.assertIn('## Rulings', (run / 'README.md').read_text())
+
+    def test_guard_hook_checks_scope_and_cache(self):
+        if shutil.which('git') is None:
+            self.skipTest('git required')
+        self.install(target='claude')
+        checks = self.root / 'tasks/checks.json'
+        config = json.loads(checks.read_text())
+        config['full'] = ['make test']
+        checks.write_text(json.dumps(config))
+        git = lambda *a: subprocess.run(['git', *a], cwd=self.root, check=True, capture_output=True)
+        git('init', '-q')
+        (self.root / 'src').mkdir()
+        (self.root / 'src/a.py').write_text('x = 1\n')
+        git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty')
+        reviewer = {'agent_id': 'r', 'agent_type': 'reviewer'}
+        def pre(command, tid, **who):
+            return self.hook({'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'tool_use_id': tid,
+                              'cwd': str(self.root), 'tool_input': {'command': command}, **who})
+        def post(command, tid, ok=True, **who):
+            self.hook({'hook_event_name': 'PostToolUse' if ok else 'PostToolUseFailure',
+                       'tool_name': 'Bash', 'tool_use_id': tid, 'cwd': str(self.root),
+                       'duration_ms': 60000, 'tool_input': {'command': command}, **who})
+        self.assertIsNotNone(pre('make test', 't1', agent_id='w', agent_type='fast-worker'))
+        self.assertIsNone(pre('pytest tests/a', 't2', agent_id='w', agent_type='fast-worker'))
+        self.assertIsNone(pre('make test', 't3', **reviewer))
+        post('make test', 't3', **reviewer)
+        (self.root / 'tasks/run-notes.md').write_text('coordinator files do not invalidate')
+        self.assertIsNotNone(pre(f'cd "{self.root}" && make test 2>&1', 't4'))  # cached pass
+        self.assertIsNone(pre('make test | tail -5', 't5'))  # pipe masks exit code: never cached
+        self.assertIsNone(pre('ORCH_RERUN=1 make test', 't6'))  # explicit rerun
+        (self.root / 'src/a.py').write_text('x = 2\n')
+        self.assertIsNone(pre('make test', 't7', **reviewer))  # code changed
+        post('make test', 't7', ok=False, **reviewer)
+        self.assertIsNone(pre('make test', 't8', **reviewer))  # last result failed
+        index = subprocess.run(['git', 'diff', '--cached', '--name-only'], cwd=self.root,
+                               capture_output=True, text=True).stdout
+        self.assertEqual(index, '')  # real index untouched
+        import os
+        out = subprocess.run([sys.executable, str(self.root / '.claude/hooks/orch_guard.py'), 'report'],
+                             capture_output=True, text=True,
+                             env={**os.environ, 'CLAUDE_PROJECT_DIR': str(self.root)}).stdout
+        self.assertIn('Повторов отклонено кэшем: 1', out)
+        self.assertIn('полных прогонов fast-worker отклонено: 1', out)
+
+    def test_checks_config_is_create_only(self):
+        self.install(target='claude')
+        checks = self.root / 'tasks/checks.json'
+        checks.write_text('{"full": ["make test"]}')
+        self.install(target='claude')
+        self.assertEqual(checks.read_text(), '{"full": ["make test"]}')
 
 if __name__ == '__main__':
     unittest.main()

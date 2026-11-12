@@ -69,7 +69,7 @@ criteria, runs meaningful applicable checks independently, and reports outcomes.
 Avoid repeating the same full suite: workers run the scoped checks for their
 ownership, the reviewer runs the full checks once, and the coordinator reruns
 them after integration only when review did not run on the integrated revision.
-Run long checks in the background where the host allows it.
+A full run that already passed on the identical tree is not repeated: cite it.
 Documentation/config tasks can use focused validation; do not create tests that
 merely mirror wording. Missing credentials/environment is BLOCKED, never ACCEPT.
 Read-only is a role contract, not a promise that Bash or tests cannot write;

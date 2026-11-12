@@ -1,0 +1,4 @@
+{
+  "full": [],
+  "test_patterns": ["pytest", "unittest", "tox", "npm test", "npm run test", "pnpm test", "yarn test", "vitest", "jest", "go test", "cargo test", "make test", "make check", "rspec", "phpunit", "gradle test", "mvn test", "ruff", "eslint", "mypy", "tsc"]
+}

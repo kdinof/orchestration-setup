@@ -12,7 +12,8 @@ END = '<!-- orchestration-setup:end -->'
 ROLES = {'scout', 'fast-worker', 'deep-reasoner', 'reviewer'}
 # Claude Code guard hook: wired into .claude/settings.json by a structural, additive merge.
 HOOK_COMMAND = 'python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/orch_guard.py"'
-HOOK_EVENTS = (('PreToolUse', 'Edit|Write|MultiEdit|NotebookEdit'), ('PostToolUse', 'SubagentHandback'),
+HOOK_EVENTS = (('PreToolUse', 'Edit|Write|MultiEdit|NotebookEdit|Bash'),
+               ('PostToolUse', 'SubagentHandback|Bash'), ('PostToolUseFailure', 'Bash'),
                ('SubagentStart', None), ('SubagentStop', None))
 
 
@@ -56,7 +57,7 @@ def merged_settings(path):
         if any(isinstance(g, dict) and isinstance(h, dict) and h.get('command') == HOOK_COMMAND
                for g in groups for h in (g.get('hooks') or [])):
             continue
-        group = {'hooks': [{'type': 'command', 'command': HOOK_COMMAND, 'timeout': 15}]}
+        group = {'hooks': [{'type': 'command', 'command': HOOK_COMMAND, 'timeout': 60}]}
         groups.append({'matcher': matcher, **group} if matcher else group)
         changed = True
     if old is not None and not changed:
@@ -123,7 +124,7 @@ def build(root, target, mode, models=None, hooks=True):
             files[root / 'tasks/roles' / path.name] = path.read_text().split('---', 2)[2].strip().encode() + b'\n'
         files[root / 'docs/devlog.md'] = b'# Devlog\n\nCoordinator writes verified task summaries here.\n'
         # User-owned configuration/journal are create-only.
-        for path in (root / 'tasks/PROJECT.md', root / 'docs/devlog.md'):
+        for path in (root / 'tasks/PROJECT.md', root / 'tasks/checks.json', root / 'docs/devlog.md'):
             if path.exists():
                 files[path] = path.read_bytes()
     return files

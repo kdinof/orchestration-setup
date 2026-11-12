@@ -10,6 +10,8 @@ are configuration work, not permission to guess commands or requirements.
 - Full checks (reviewer once per task; coordinator after integration only if
   review ran on another revision): TODO
 - Required environment: TODO
+- Claude: put the exact full-check command(s) into `tasks/checks.json` → `full`
+  (the guard hook keeps them away from fast-worker and caches passing runs).
 - Integration gate command/scenario: see each run README
 - Maximum active child agents, across ALL roles: 3 (or lower host limit)
 - Runtime: TODO (claude / codex)

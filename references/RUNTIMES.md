@@ -12,8 +12,9 @@ Do not assume built-in Explore always inherits an expensive main model.
 ### Guard hook
 
 `setup --target claude|both` installs `.claude/hooks/orch_guard.py` and adds it
-to `.claude/settings.json` (PreToolUse on Edit/Write/MultiEdit/NotebookEdit,
-PostToolUse on SubagentHandback, SubagentStart, SubagentStop). The merge only
+to `.claude/settings.json` (PreToolUse on Edit/Write/MultiEdit/NotebookEdit/Bash,
+PostToolUse on SubagentHandback/Bash, PostToolUseFailure on Bash, SubagentStart,
+SubagentStop). The merge only
 adds missing entries and keeps every other setting; `--no-claude-hooks` skips
 both the file and the settings change. Hooks of a project run only after the
 user accepts the folder trust dialog.
@@ -30,6 +31,21 @@ worker's edits is still checked by the reviewer; token totals come from the
 subagent transcript and are best effort. The owner can lift the edit guard for
 an authorized single-agent fallback with `ORCH_ALLOW_MAIN_EDITS=1`. A stale
 `tasks/.active-run` after an aborted run must be deleted by the owner.
+
+Checks. `tasks/checks.json` (create-only) holds `full` — the exact full-check
+commands — and `test_patterns` used to recognize scoped checks for measurement.
+With `full` empty only measurement works. The hook denies a full command from
+fast-worker. Before a full run it fingerprints the working tree (temporary git
+index + `write-tree`; the real index is untouched; `tasks/`, `docs/devlog.md`,
+`docs/solutions/` are excluded) and denies a rerun when the same command already
+passed on that tree, quoting the earlier result. Only plain foreground runs are
+cached (`cd dir && <full> 2>&1` is fine; pipes, `||`, chains and background runs
+are not, because they can mask the exit code or finish later). A pass is the
+`PostToolUse` event, a failure `PostToolUseFailure`; failures are never reused.
+The fingerprint covers code, not environment: prefix the command with
+`ORCH_RERUN=1` after changing services, data or env, or for flaky suites. Keep
+test artifacts git-ignored, otherwise they change the fingerprint. The report
+shows check time per role, its share of subagent time and minutes saved.
 
 ## Codex
 
